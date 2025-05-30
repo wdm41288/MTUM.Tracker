@@ -1,10 +1,11 @@
+%%writefile etf_tracker_auto.py
 import pandas as pd
 import os
 import glob
 import argparse
 from datetime import datetime
 import requests
-import io # Needed for StringIO
+import sys # For sys.exit
 
 # --- Configuration ---
 ETF_SYMBOL = "MTUM"
@@ -16,32 +17,37 @@ TICKER_COL = 'Ticker'
 NAME_COL = 'Name'
 WEIGHT_COL = 'Weight (%)'
 ALT_WEIGHT_COLS = ['Weight', 'Weighting', 'Portfolio Weight', 'Market Weight']
-DATA_DIR = "etf_holdings_data" # This will be relative to args.save_dir in main()
+DEFAULT_SAVE_DIR = "etf_data" # Relative path, good for GitHub Actions
+MASTER_EXCEL_FILENAME_DEFAULT = f"{ETF_SYMBOL}_Master_Holdings.xlsx"
 
 def download_mtum_holdings(save_directory):
+    """Downloads MTUM holdings CSV file."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9",
         "Referer": f"https://www.ishares.com/us/products/{ETF_PRODUCT_ID}/{ETF_SLUG}/"
     }
     try:
-        print(f"Attempting to download MTUM holdings from: {DOWNLOAD_URL}")
+        print(f"Attempting to download {ETF_SYMBOL} holdings from: {DOWNLOAD_URL}")
         response = requests.get(DOWNLOAD_URL, headers=headers, stream=True, timeout=60)
         response.raise_for_status()
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"{ETF_SYMBOL}_holdings_{timestamp}.csv"
+        raw_filename = f"{ETF_SYMBOL}_downloaded_content_{timestamp}.csv" # Tentative extension
+
         if not os.path.exists(save_directory):
             try:
-                os.makedirs(save_directory, exist_ok=True) # Added exist_ok=True
+                os.makedirs(save_directory)
                 print(f"Created save directory: {save_directory}")
             except OSError as e:
                 print(f"Error creating directory {save_directory}: {e}")
                 return None
-        filepath = os.path.join(save_directory, filename)
+
+        filepath = os.path.join(save_directory, raw_filename)
         with open(filepath, 'wb') as f:
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
-        print(f"Successfully downloaded file to: {filepath}")
+        print(f"Successfully downloaded content to: {filepath}")
         return filepath
     except requests.exceptions.Timeout:
         print(f"Error: Timeout occurred while trying to download from {DOWNLOAD_URL}")
@@ -53,6 +59,14 @@ def download_mtum_holdings(save_directory):
         print(f"Error: HTTP error {e.response.status_code} while downloading from {DOWNLOAD_URL}")
         error_preview = e.response.text[:500] if e.response.text else "No content"
         print(f"Response content preview: {error_preview}")
+        if e.response.headers.get('Content-Type', '').startswith('text/html'):
+            html_error_path = os.path.join(save_directory, f"{ETF_SYMBOL}_error_page_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html")
+            try:
+                with open(html_error_path, 'w', encoding='utf-8') as f_html:
+                    f_html.write(e.response.text)
+                print(f"HTML error page saved to: {html_error_path}")
+            except Exception as e_save_html:
+                 print(f"Could not save HTML error page: {e_save_html}")
         return None
     except Exception as e:
         print(f"An unexpected error occurred during download: {e}")
@@ -60,385 +74,332 @@ def download_mtum_holdings(save_directory):
         traceback.print_exc()
         return None
 
-def load_and_process_holdings(csv_filepath):
-    print(f"Processing downloaded CSV file: {csv_filepath}")
-    if not os.path.exists(csv_filepath):
-        print(f"Error: File not found at {csv_filepath}")
+def load_and_process_holdings(downloaded_filepath):
+    """Loads and processes the downloaded ETF holdings CSV file."""
+    print(f"Processing downloaded file: {downloaded_filepath}")
+    if not os.path.exists(downloaded_filepath):
+        print(f"Error: File not found at {downloaded_filepath}")
         return None
 
     df = None
-    try:
-        print(f"Attempting to read {csv_filepath} as CSV...")
-        with open(csv_filepath, 'r', encoding='utf-8-sig') as f_preview:
-            preview_lines = [f_preview.readline() for _ in range(20)]
+    skiprows = 0
 
-        skiprows = 0
-        header_found_by_keywords = False
+    try:
+        with open(downloaded_filepath, 'r', encoding='utf-8-sig') as f_preview:
+            preview_lines = [f_preview.readline() for _ in range(20)] # Read more lines for better detection
+
+        header_keywords_primary = [TICKER_COL.lower(), NAME_COL.lower()] # Key columns like Ticker, Name
+        header_keywords_secondary = [WEIGHT_COL.lower()] # Weight column can vary more
+
+        # Try to find a line that starts with "Ticker" or contains key headers
+        # iShares files may have variable preamble lines.
+        found_header_row = -1
         for i, line in enumerate(preview_lines):
-            if TICKER_COL in line and NAME_COL in line and (WEIGHT_COL in line or any(alt_w in line for alt_w in ALT_WEIGHT_COLS)):
-                skiprows = i
-                header_found_by_keywords = True
-                print(f"Header likely found at line {i+1} (skiprows={skiprows}) based on keywords.")
+            line_lower_stripped = line.lower().strip()
+            if not line_lower_stripped: continue # Skip empty lines
+
+            # Check if it looks like a header row
+            if line_lower_stripped.startswith(TICKER_COL.lower()) or \
+               (all(keyword in line_lower_stripped for keyword in header_keywords_primary) and \
+                any(keyword in line_lower_stripped for keyword in header_keywords_secondary)):
+                found_header_row = i
                 break
         
-        if not header_found_by_keywords:
-            # Fallback: try to find the "Fund Holdings as of" or similar common iShares lines
-            # This part might need adjustment if the CSV format changes frequently
-            common_skip_phrases = ["Fund Holdings as of", "Holdings as of", "Ticker,Name,Sector"] # Add more if needed
-            for i, line in enumerate(preview_lines):
-                if any(phrase.lower() in line.lower() for phrase in common_skip_phrases):
-                    # If a known phrase is found, the header is often the next line or two after.
-                    # This is an assumption and might need refinement.
-                    # Example: if "Fund Holdings as of" is line X, header might be X+1 or X+2.
-                    # For now, let's assume header is immediately after the first such phrase,
-                    # or if "Ticker,Name,Sector" like string is found, that's the header.
-                    if "Ticker" in line and "Name" in line: # If the phrase itself contains header keywords
-                        skiprows = i
-                    else: # Assume header is next line
-                        skiprows = i + 1 
-                    print(f"Header possibly found at line {skiprows + 1} based on phrase '{line.strip()}' and taking next line(s).")
-                    if skiprows >= len(preview_lines): # ensure skiprows is not out of bounds of preview
-                        skiprows = i # fallback to current line if next is too far
-                    header_found_by_keywords = True # Mark as found to avoid warning
-                    break
+        if found_header_row != -1:
+            skiprows = found_header_row
+            print(f"Detected header at line {skiprows + 1} (skiprows={skiprows}).")
+        else:
+            # Fallback for specific iShares CSV structure if keywords fail
+            # For "fileName=MTUM_holdings" type, data often starts after line 9 (skiprows=9)
+            # Other iShares files might skip 2 or 3 lines.
+            # If the file starts with "Fund Holdings as of", "Holdings as of Date", it means we need to skip more.
+            if any(line.strip().startswith("Fund Holdings as of") or line.strip().startswith("Holdings as of Date") for line in preview_lines[:5]):
+                skiprows = 9 # A common value for such files
+                print(f"Found 'Fund Holdings as of' type preamble. Setting skiprows to {skiprows} as a common default.")
+            elif preview_lines[0].strip().startswith(TICKER_COL): # If Ticker is on the very first line
+                skiprows = 0
+                print("Header seems to be on the first line. Setting skiprows to 0.")
+            else: # General fallback if specific patterns aren't met
+                skiprows = 9 # Default for MTUM_holdings URL if specific detection fails
+                print(f"Could not reliably detect header. Using default skiprows={skiprows} for {ETF_SYMBOL} specific URL.")
+
+    except Exception as e_preview:
+        print(f"Error during CSV preview/skiprows detection: {e_preview}. Will try common skips.")
+        skiprows = 9 # Fallback to common skip if preview fails
+
+    # Attempt to read CSV with detected or default skiprows
+    read_successful = False
+    for skip_attempt in [skiprows, 9, 2, 0]: # Try detected, then common fallbacks
+        if read_successful: break
+        try:
+            print(f"Attempting to read CSV with skiprows={skip_attempt}")
+            df = pd.read_csv(downloaded_filepath, encoding='utf-8-sig', skiprows=skip_attempt, on_bad_lines='warn')
             
-        if not header_found_by_keywords:
-            print("Warning: Could not reliably detect header row in CSV preview by keywords or common phrases.")
-            print("Attempting to read CSV assuming header is at or near the top (skiprows=0 or letting pandas infer).")
-            # Defaulting to skiprows=0 if no better guess. Pandas might infer but it's less reliable.
-            # For specific iShares files, a fixed skiprows (e.g., 9 or 10) might be a last resort if other detections fail.
-            # skiprows = 9 # Example fixed skip, uncomment and adjust if necessary as a last resort.
+            if df.empty or len(df.columns) < 2: # Check if df is substantially empty
+                print(f"Read with skiprows={skip_attempt} resulted in an empty or near-empty DataFrame. Columns: {df.columns.tolist()}")
+                df = None # Reset df to trigger next attempt or failure
+                continue # Try next skip_attempt
 
+            print(f"Successfully parsed CSV file with skiprows={skip_attempt}.")
+            print(f"Columns found: {df.columns.tolist()}")
+            read_successful = True
+        except pd.errors.EmptyDataError:
+            print(f"EmptyDataError: The CSV file at {downloaded_filepath} is empty or became empty after skipping {skip_attempt} rows.")
+            df = None
+        except Exception as e_csv:
+            print(f"Failed to read CSV with skiprows={skip_attempt}: {e_csv}")
+            df = None # Reset df
 
-        print(f"Attempting to read CSV with skiprows={skiprows}")
-        df = pd.read_csv(csv_filepath, encoding='utf-8-sig', skiprows=skiprows, on_bad_lines='skip')
-
-        print("Successfully parsed CSV file (or attempted to).")
-        print(f"Columns found after pd.read_csv: {df.columns.tolist()}")
-        print(f"First few rows of the parsed table:\n{df.head().to_string()}")
-
-    except Exception as e_csv:
-        print(f"Failed to read or process CSV file: {e_csv}")
-        import traceback
-        traceback.print_exc()
+    if not read_successful or df is None or df.empty:
+        print("All attempts to read CSV failed or resulted in an empty DataFrame.")
+        try:
+            with open(downloaded_filepath, 'r', encoding='utf-8-sig', errors='ignore') as f_err:
+                print(f"--- Start of raw file content for {downloaded_filepath} ---")
+                for _ in range(20): # Print more lines for debugging
+                    line = f_err.readline()
+                    if not line: break
+                    print(line, end='')
+                print(f"--- End of raw file content preview ---")
+        except Exception as e_read_raw:
+            print(f"Could not even read raw file for preview: {e_read_raw}")
         return None
 
-    if df is None or df.empty:
-        print("DataFrame is empty after CSV parsing.")
-        return None
+    df.columns = [str(col).strip() for col in df.columns] # Strip spaces from column names
 
-    print("\nProcessing DataFrame obtained from CSV. Verify column names based on printout above.")
-    actual_ticker_col_name, actual_name_col_name, actual_weight_col_name = None, None, None
+    actual_ticker_col, actual_name_col, actual_weight_col = None, None, None
+    potential_cols = df.columns.tolist()
+
+    # Find Ticker column
+    for col_candidate in [TICKER_COL] + [c for c in potential_cols if 'ticker' in c.lower() or 'symbol' in c.lower()]:
+        if col_candidate in potential_cols: actual_ticker_col = col_candidate; break
+    if not actual_ticker_col and potential_cols: actual_ticker_col = potential_cols[0] # Default to first if not found
+
+    # Find Name column
+    for col_candidate in [NAME_COL] + [c for c in potential_cols if 'name' in c.lower() and 'company' not in c.lower() and 'identifier' not in c.lower()]:
+        if col_candidate in potential_cols: actual_name_col = col_candidate; break
+    if not actual_name_col and len(potential_cols) > 1: # Try to find a likely name col if not first
+        for col_idx in range(1, min(3, len(potential_cols))): # Check 2nd or 3rd column
+             if isinstance(df[potential_cols[col_idx]].iloc[0], str) and len(df[potential_cols[col_idx]].iloc[0]) > 3 : # Heuristic for name
+                actual_name_col = potential_cols[col_idx]; break
+
+    # Find Weight column
+    for col_candidate in [WEIGHT_COL] + ALT_WEIGHT_COLS + [c for c in potential_cols if 'weight' in c.lower()]:
+        if col_candidate in potential_cols: actual_weight_col = col_candidate; break
+
+    if not actual_ticker_col: print(f"CRITICAL: Ticker column not found. Cols: {potential_cols}"); return None
+    if not actual_weight_col: print(f"CRITICAL: Weight column not found. Cols: {potential_cols}"); return None
+    if not actual_name_col: print(f"Warning: Name column not found. Will use Ticker. Cols: {potential_cols}")
+
+    cols_to_select = {actual_ticker_col: 'Ticker', actual_weight_col: 'Weight'}
+    if actual_name_col: cols_to_select[actual_name_col] = 'Name'
     
-    # Clean column names (strip spaces, etc.)
-    df.columns = [str(col).strip() for col in df.columns]
-    print(f"Cleaned column names: {df.columns.tolist()}")
-
-
-    for col_name_iter in df.columns:
-        if col_name_iter == TICKER_COL: actual_ticker_col_name = col_name_iter
-        if col_name_iter == NAME_COL: actual_name_col_name = col_name_iter
-        if col_name_iter == WEIGHT_COL: actual_weight_col_name = col_name_iter
-
-    if actual_weight_col_name is None:
-        for alt_w_col in ALT_WEIGHT_COLS:
-            for col_name_iter in df.columns:
-                if col_name_iter == alt_w_col:
-                    actual_weight_col_name = col_name_iter
-                    print(f"Using alternative weight column: '{alt_w_col}'")
-                    break
-            if actual_weight_col_name: break
-    
-    # If primary TICKER_COL is not found, check for common alternatives
-    if not actual_ticker_col_name:
-        alt_ticker_cols = ['Identifier', 'Symbol'] # Common alternatives
-        for alt_t_col in alt_ticker_cols:
-            if alt_t_col in df.columns:
-                actual_ticker_col_name = alt_t_col
-                print(f"Using alternative ticker column: '{alt_t_col}'")
-                break
-
-
-    if not actual_ticker_col_name:
-        print(f"CRITICAL: Ticker column ('{TICKER_COL}' or alternatives) not found. Available: {df.columns.tolist()}")
-        return None
-    if not actual_weight_col_name:
-        print(f"CRITICAL: Weight column ('{WEIGHT_COL}' or alternatives) not found. Available: {df.columns.tolist()}")
+    try:
+        holdings_df = df[list(cols_to_select.keys())].copy()
+    except KeyError as e:
+        print(f"KeyError during column selection: {e}. This means a selected column name wasn't actually in df.columns.")
+        print(f"Selected map: {cols_to_select}, DataFrame columns: {df.columns.tolist()}")
         return None
 
-    selected_cols_map = {actual_ticker_col_name: 'Ticker', actual_weight_col_name: 'Weight'}
-    if actual_name_col_name:
-        selected_cols_map[actual_name_col_name] = 'Name'
-    
-    # Check if all selected columns exist before trying to slice
-    missing_cols = [col for col in selected_cols_map.keys() if col not in df.columns]
-    if missing_cols:
-        print(f"CRITICAL: One or more identified key columns are not actually in the DataFrame: {missing_cols}")
-        print(f"Available columns for selection: {df.columns.tolist()}")
-        return None
-
-    holdings_df = df[list(selected_cols_map.keys())].copy()
-    holdings_df.rename(columns=selected_cols_map, inplace=True)
-
-    if 'Name' not in holdings_df.columns:
-        print(f"Warning: Name column '{NAME_COL}' not found or not mapped. Using Ticker for Name.")
-        holdings_df['Name'] = holdings_df['Ticker'] # Fallback
+    holdings_df.rename(columns=cols_to_select, inplace=True)
+    if 'Name' not in holdings_df.columns: holdings_df['Name'] = holdings_df['Ticker']
 
     holdings_df['Ticker'] = holdings_df['Ticker'].astype(str).str.strip()
-    # Remove rows where Ticker might be a placeholder like 'nan', '-', '', or the header itself
-    holdings_df = holdings_df[~holdings_df['Ticker'].str.lower().isin(['nan', '-', '', 'ticker', 'pending', 'cash', 'not available'])]
-    # Remove rows if ticker looks like a date (sometimes happens with malformed CSVs)
-    holdings_df = holdings_df[~holdings_df['Ticker'].str.match(r'\d{1,2}/\d{1,2}/\d{2,4}')]
+    invalid_tickers = ['nan', '-', '', 'ticker', 'fund holdings as of', 'average s&p market cap', 'net assets', 'total market value'] # Added more
+    holdings_df = holdings_df[~holdings_df['Ticker'].str.lower().isin(invalid_tickers)]
+    holdings_df = holdings_df[~holdings_df['Ticker'].str.match(r'\d{1,2}/\d{1,2}/\d{2,4}')] # M/D/YY or M/D/YYYY
+    holdings_df = holdings_df[~holdings_df['Ticker'].str.lower().str.contains(r'cash and/or derivatives', na=False)]
+    holdings_df = holdings_df[~holdings_df['Ticker'].str.lower().str.contains(r'total holdings', na=False)]
 
 
     if 'Weight' not in holdings_df.columns or holdings_df['Weight'].isnull().all():
-        print(f"Error: 'Weight' column is missing or all NaN after selection and renaming. Check CSV table and column mapping.")
+        print(f"Error: 'Weight' column is missing or all NaN after selection. Check CSV and mappings.")
         return None
 
     if holdings_df['Weight'].dtype == 'object':
-        holdings_df['Weight_str'] = holdings_df['Weight'].astype(str)
-        holdings_df['Weight'] = holdings_df['Weight_str'].str.rstrip('%').str.replace(',', '').str.strip() # Added , removal
-        holdings_df['Weight'] = holdings_df['Weight'].replace(['-', 'n/a', 'N/A', '','nan','<0.01'], pd.NA, regex=False) # Added <0.01
-
+        holdings_df['Weight'] = holdings_df['Weight'].astype(str).str.replace(',', '', regex=False).str.rstrip('%').str.strip()
+        holdings_df['Weight'] = holdings_df['Weight'].replace(['-', 'n/a', 'N/A', '', 'Market Value'], pd.NA, regex=False) # Added Market Value
     holdings_df['Weight'] = pd.to_numeric(holdings_df['Weight'], errors='coerce')
-    
-    # Handle cases where weight might be extremely small and represented as 0 or NA after <0.01 conversion
-    # For financial data, sometimes <0.01% is reported. If it became NA, treat as a very small number or 0.
-    # For this script, we'll keep them as NA to be dropped by dropna unless a specific small value is desired.
-    # If '<0.01' was replaced by NA and then to_numeric coerced it to NA, it will be dropped.
-    # If it was a value like '0.005' it would be kept.
 
     original_rows = len(holdings_df)
-    holdings_df.dropna(subset=['Weight', 'Ticker'], inplace=True)
-    # Filter out any zero or negative weights that might not be meaningful for 'holdings'
+    holdings_df.dropna(subset=['Ticker', 'Weight'], inplace=True)
     holdings_df = holdings_df[holdings_df['Weight'] > 0]
-
     if len(holdings_df) < original_rows:
-        print(f"Warning: Dropped {original_rows - len(holdings_df)} rows due to invalid/missing Ticker or Weight (e.g., NaN, zero, negative, or placeholder values).")
-    
-    if holdings_df.empty:
-        print("Error: No valid holdings data found after cleaning. DataFrame is empty.")
-        return None
+        print(f"Dropped {original_rows - len(holdings_df)} rows due to invalid/missing Ticker/Weight or zero/negative weight.")
+
+    if holdings_df.empty: print("Error: No valid holdings data after cleaning."); return None
 
     holdings_df = holdings_df.sort_values(by='Weight', ascending=False).reset_index(drop=True)
     holdings_df['Rank'] = holdings_df.index + 1
-    
-    # Ensure all final columns are present
     final_cols = ['Rank', 'Ticker', 'Name', 'Weight']
     for col in final_cols:
-        if col not in holdings_df.columns:
-            if col == 'Name': holdings_df[col] = holdings_df['Ticker'] # Default name to ticker if missing
-            else: holdings_df[col] = pd.NA # Add other missing columns as NA
+        if col not in holdings_df.columns: holdings_df[col] = holdings_df.get('Ticker' if col == 'Name' else pd.NA)
+    holdings_df = holdings_df[final_cols]
 
-    holdings_df = holdings_df[final_cols] # Reorder and select final columns
     print(f"\nProcessed {len(holdings_df)} holdings.")
-    print(f"Top 5 processed holdings:\n{holdings_df.head().to_string()}")
     return holdings_df
 
-def save_holdings(df, etf_symbol_for_csv):
-    global DATA_DIR # DATA_DIR is now set in main() relative to args.save_dir
-    if not os.path.exists(DATA_DIR):
+def save_daily_csv(df, etf_symbol_for_csv, historical_data_dir):
+    """Saves the current day's holdings to a CSV file in the historical data directory."""
+    if df is None or df.empty:
+        print("No data to save for daily CSV.")
+        return
+    if not os.path.exists(historical_data_dir):
         try:
-            os.makedirs(DATA_DIR, exist_ok=True) # Added exist_ok=True
-            print(f"Created historical data directory: {DATA_DIR}")
+            os.makedirs(historical_data_dir)
+            print(f"Created historical data directory: {historical_data_dir}")
         except OSError as e:
-            print(f"Error creating directory {DATA_DIR}: {e}. Cannot save.")
+            print(f"Error creating directory {historical_data_dir}: {e}. Cannot save daily CSV.")
             return
+
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"{etf_symbol_for_csv}_holdings_{date_str}.csv"
-    filepath = os.path.join(DATA_DIR, filename)
+    filepath = os.path.join(historical_data_dir, filename)
     try:
-        df.to_csv(filepath, index=False)
-        print(f"Successfully saved current holdings to: {filepath}")
+        df.to_csv(filepath, index=False, encoding='utf-8-sig')
+        print(f"Successfully saved current holdings to daily CSV: {filepath}")
     except Exception as e:
         print(f"Error saving holdings to {filepath}: {e}")
 
-def load_previous_holdings(etf_symbol_for_csv):
-    global DATA_DIR # DATA_DIR is now set in main() relative to args.save_dir
-    if not os.path.exists(DATA_DIR):
-        print(f"Historical data directory not found: {DATA_DIR}")
-        return None
-    
-    list_of_files = glob.glob(os.path.join(DATA_DIR, f"{etf_symbol_for_csv}_holdings_*.csv"))
-    if not list_of_files:
-        print(f"No historical files found for {etf_symbol_for_csv} in {DATA_DIR}")
+def update_master_excel(df, master_excel_path):
+    """Adds the current holdings as a new sheet to the master Excel file."""
+    if df is None or df.empty:
+        print("No data to update in master Excel file.")
+        return
+
+    date_str_sheet_name = datetime.now().strftime("%Y-%m-%d")
+    print(f"Updating master Excel file: {master_excel_path} with sheet: {date_str_sheet_name}")
+
+    master_excel_dir = os.path.dirname(master_excel_path)
+    if master_excel_dir and not os.path.exists(master_excel_dir):
+        try: os.makedirs(master_excel_dir); print(f"Created directory for master Excel: {master_excel_dir}")
+        except OSError as e: print(f"Error creating directory for master Excel {master_excel_dir}: {e}"); return
+
+    mode = 'a' if os.path.exists(master_excel_path) else 'w'
+    if_sheet_exists_option = 'replace' if mode == 'a' else None # if file exists, replace sheet; else, None for new file
+    engine_kwargs = {}
+    if mode == 'w' and if_sheet_exists_option : # Should not happen with this logic but as safeguard for openpyxl
+         pass # if_sheet_exists not valid for mode 'w' with openpyxl explicitly.
+
+    try:
+        with pd.ExcelWriter(master_excel_path, engine='openpyxl', mode=mode, if_sheet_exists=if_sheet_exists_option, engine_kwargs=engine_kwargs) as writer:
+            df.to_excel(writer, sheet_name=date_str_sheet_name, index=False)
+        print(f"Successfully updated master Excel file: {master_excel_path} with sheet '{date_str_sheet_name}'")
+    except Exception as e:
+        print(f"Error updating master Excel file {master_excel_path}: {e}")
+        if "zipfile.BadZipFile" in str(e) or "File is not a zip file" in str(e):
+             print("This might be due to an existing corrupted Excel file. Try deleting or checking its integrity.")
+             print(f"Attempting to save as a new file if corruption detected and mode was 'a'...")
+             if mode == 'a': # If append mode failed due to corruption, try writing new.
+                 try:
+                     new_master_path = master_excel_path.replace(".xlsx", f"_new_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx")
+                     with pd.ExcelWriter(new_master_path, engine='openpyxl', mode='w') as writer_new:
+                         df.to_excel(writer_new, sheet_name=date_str_sheet_name, index=False)
+                     print(f"Saved to a new file due to corruption: {new_master_path}")
+                 except Exception as e_new:
+                     print(f"Could not save to a new file either: {e_new}")
+
+
+def load_previous_holdings_from_csv(etf_symbol_for_csv, historical_data_dir):
+    """Loads the most recent previous day's holdings from the historical CSVs."""
+    if not os.path.exists(historical_data_dir):
+        print(f"Historical data directory not found: {historical_data_dir}")
         return None
 
-    # Exclude today's file from being considered as "previous"
+    list_of_files = glob.glob(os.path.join(historical_data_dir, f"{etf_symbol_for_csv}_holdings_*.csv"))
+    if not list_of_files:
+        print("No historical CSV files found.")
+        return None
+
     today_date_str = datetime.now().strftime("%Y-%m-%d")
     today_filename_pattern = f"{etf_symbol_for_csv}_holdings_{today_date_str}.csv"
-    
-    previous_files = [
-        f for f in list_of_files 
-        if os.path.basename(f) != today_filename_pattern
-    ]
+    previous_files = [f for f in list_of_files if os.path.basename(f) != today_filename_pattern]
 
     if not previous_files:
-        print(f"No previous day's files found for {etf_symbol_for_csv} in {DATA_DIR} (excluding today's file if present).")
+        print("No previous historical CSV files found (excluding today's).")
         return None
-        
-    latest_file = max(previous_files, key=os.path.getctime)
-    print(f"Loading previous holdings from: {latest_file}")
     try:
+        latest_file = max(previous_files, key=os.path.getctime)
+        print(f"Loading previous holdings from CSV: {latest_file}")
         return pd.read_csv(latest_file)
-    except Exception as e:
-        print(f"Error loading previous file {latest_file}: {e}")
-        return None
+    except ValueError: print("No previous CSV files found to load."); return None
+    except Exception as e: print(f"Error loading previous file {latest_file if 'latest_file' in locals() else 'unknown'}: {e}"); return None
 
 def compare_holdings(current_df, previous_df, top_n=20):
+    """Compares current holdings with previous holdings."""
+    if previous_df is None or previous_df.empty: print("\nNo previous holdings to compare against."); return
+    if current_df is None or current_df.empty: print("\nCurrent holdings are empty, cannot compare."); return
     print("\n--- Holdings Comparison ---")
+    if 'Ticker' not in current_df.columns or 'Ticker' not in previous_df.columns:
+        print("Error: 'Ticker' column missing for comparison."); return
+
     comparison_df = pd.merge(current_df, previous_df, on='Ticker', how='outer', suffixes=('_curr', '_prev'))
-    
-    # Fill NaNs for rank and weight for proper comparison
     for col_suffix in ['_curr', '_prev']:
-        comparison_df[f'Rank{col_suffix}'].fillna(float('inf'), inplace=True) # Use inf for rank sorting
+        comparison_df[f'Rank{col_suffix}'].fillna(99999, inplace=True)
         comparison_df[f'Weight{col_suffix}'].fillna(0, inplace=True)
-        name_col_curr = 'Name_curr'
-        name_col_prev = 'Name_prev'
-
-    # Consolidate Name: Prioritize current name, then previous, then Ticker
-    comparison_df['Name'] = comparison_df[name_col_curr].fillna(comparison_df[name_col_prev])
-    comparison_df['Name'].fillna(comparison_df['Ticker'], inplace=True)
-
+        if f'Name{col_suffix}' not in comparison_df.columns: comparison_df[f'Name{col_suffix}'] = ""
+    comparison_df['Name_consolidated'] = comparison_df['Name_curr'].combine_first(comparison_df['Name_prev']).fillna(comparison_df['Ticker'])
     comparison_df['Rank_Change'] = comparison_df['Rank_prev'] - comparison_df['Rank_curr']
     comparison_df['Weight_Change'] = comparison_df['Weight_curr'] - comparison_df['Weight_prev']
-    
-    # Adjust Rank_Change for new/dropped items where prev/curr rank was inf
-    comparison_df.loc[comparison_df['Rank_prev'] == float('inf'), 'Rank_Change'] = float('nan') # New items have no rank change
-    comparison_df.loc[comparison_df['Rank_curr'] == float('inf'), 'Rank_Change'] = float('nan') # Dropped items have no rank change
 
+    new_holdings = comparison_df[comparison_df['Weight_prev'] == 0][['Rank_curr', 'Ticker', 'Name_consolidated', 'Weight_curr']].rename(
+        columns={'Rank_curr': 'Rank', 'Name_consolidated': 'Name', 'Weight_curr': 'Weight'}).sort_values(by='Rank')
+    dropped_holdings = comparison_df[comparison_df['Weight_curr'] == 0][['Rank_prev', 'Ticker', 'Name_consolidated', 'Weight_prev']].rename(
+        columns={'Rank_prev': 'Old Rank', 'Name_consolidated': 'Name', 'Weight_prev': 'Old Weight'}).sort_values(by='Old Rank')
+    changed_holdings = comparison_df[(comparison_df['Weight_curr'] > 0) & (comparison_df['Weight_prev'] > 0)].rename(
+        columns={'Name_consolidated': 'Name'}).sort_values(by='Rank_curr')
 
-    new_holdings = comparison_df[comparison_df['Weight_prev'] == 0].copy()
-    new_holdings = new_holdings[['Rank_curr', 'Ticker', 'Name', 'Weight_curr']].rename(
-        columns={'Rank_curr': 'Rank', 'Weight_curr': 'Weight'}
-    ).sort_values(by='Rank')
-    new_holdings['Rank'] = new_holdings['Rank'].astype(int)
-
-
-    dropped_holdings = comparison_df[comparison_df['Weight_curr'] == 0].copy()
-    dropped_holdings = dropped_holdings[['Rank_prev', 'Ticker', 'Name', 'Weight_prev']].rename(
-        columns={'Rank_prev': 'Prev_Rank', 'Weight_prev': 'Prev_Weight'} # Clarify prev fields
-    ).sort_values(by='Prev_Rank')
-    dropped_holdings['Prev_Rank'] = dropped_holdings['Prev_Rank'].astype(int)
-
-
-    changed_holdings = comparison_df[(comparison_df['Weight_curr'] > 0) & (comparison_df['Weight_prev'] > 0)].copy()
-    changed_holdings = changed_holdings.sort_values(by='Rank_curr')
-    changed_holdings['Rank_curr'] = changed_holdings['Rank_curr'].astype(int)
-    changed_holdings['Rank_prev'] = changed_holdings['Rank_prev'].astype(int)
-
-
-    print(f"\nTop {top_n} Current Holdings:")
-    print(current_df[['Rank', 'Ticker', 'Name', 'Weight']].head(top_n).to_string(index=False))
-    
-    if not new_holdings.empty:
-        print(f"\nNew Holdings (Top {top_n} of new, if many):")
-        print(new_holdings[['Rank', 'Ticker', 'Name', 'Weight']].head(top_n).to_string(index=False))
-    else:
-        print("\nNo new holdings found.")
-        
-    if not dropped_holdings.empty:
-        print(f"\nDropped Holdings (Previously Top {top_n} of dropped, if many):")
-        # Show dropped holdings that were previously ranked, e.g., within top N or all if few
-        print(dropped_holdings[['Prev_Rank', 'Ticker', 'Name', 'Prev_Weight']].head(top_n).to_string(index=False))
-    else:
-        print("\nNo holdings dropped.")
+    print(f"\nTop {top_n} Current Holdings:\n{current_df[['Rank', 'Ticker', 'Name', 'Weight']].head(top_n).to_string(index=False)}")
+    if not new_holdings.empty: print(f"\nNew Holdings (Top {top_n} of new):\n{new_holdings.head(top_n).to_string(index=False)}")
+    else: print("\nNo new holdings found.")
+    if not dropped_holdings.empty: print(f"\nDropped Holdings (Top {top_n} of prev rank):\n{dropped_holdings[dropped_holdings['Old Rank'] <= top_n].head(top_n).to_string(index=False)}")
+    else: print("\nNo holdings dropped.")
 
     if not changed_holdings.empty:
-        # Significant Rank Changes: Absolute change > 5 OR crossed top_n boundary
-        sig_rank_chg = changed_holdings[
-            (abs(changed_holdings['Rank_Change']) > 5) |
-            ((changed_holdings['Rank_curr'] <= top_n) & (changed_holdings['Rank_prev'] > top_n)) |
-            ((changed_holdings['Rank_curr'] > top_n) & (changed_holdings['Rank_prev'] <= top_n))
-        ].sort_values(by='Rank_Change', key=abs, ascending=False) # Sort by magnitude of change
-
-        if not sig_rank_chg.empty:
-            print(f"\nSignificant Rank Changes (Top {top_n} by magnitude of change):")
-            print(sig_rank_chg[['Rank_curr', 'Ticker', 'Name', 'Rank_prev', 'Rank_Change', 'Weight_curr', 'Weight_prev', 'Weight_Change']].head(top_n).to_string(index=False))
-        else:
-            print("\nNo significant rank changes meeting criteria.")
-
-        # Significant Weight Changes: Absolute change > 0.1%
-        # Sort by absolute magnitude of weight change to see largest impacts first
-        sig_wght_chg = changed_holdings.reindex(
-            changed_holdings['Weight_Change'].abs().sort_values(ascending=False).index
-        )
-        sig_wght_chg = sig_wght_chg[sig_wght_chg['Weight_Change'].abs() > 0.1]
-
-
-        if not sig_wght_chg.empty:
-            print(f"\nSignificant Weight Changes (> +/- 0.1%, Top {top_n} by magnitude of change):")
-            print(sig_wght_chg[['Rank_curr', 'Ticker', 'Name', 'Weight_curr', 'Weight_prev', 'Weight_Change']].head(top_n).to_string(index=False))
-        else:
-            print("\nNo significant weight changes (> +/- 0.1%).")
-    else:
-        print("\nNo continuously held stocks to compare changes for.")
+        sig_rank_chg = changed_holdings[(abs(changed_holdings['Rank_Change']) > 5) | \
+                                        ((changed_holdings['Rank_curr'] <= top_n) & (changed_holdings['Rank_prev'] > top_n)) | \
+                                        ((changed_holdings['Rank_curr'] > top_n) & (changed_holdings['Rank_prev'] <= top_n))]\
+                                        .sort_values(by=lambda x: abs(x['Rank_Change']), ascending=False)
+        if not sig_rank_chg.empty: print(f"\nSignificant Rank Changes (Top {top_n} by magnitude):\n{sig_rank_chg[['Rank_curr', 'Ticker', 'Name', 'Rank_prev', 'Rank_Change', 'Weight_curr', 'Weight_prev', 'Weight_Change']].head(top_n).to_string(index=False)}")
+        else: print("\nNo significant rank changes meeting criteria.")
+        sig_wght_chg = changed_holdings[abs(changed_holdings['Weight_Change']) > 0.1].copy()
+        sig_wght_chg = sig_wght_chg.reindex(sig_wght_chg['Weight_Change'].abs().sort_values(ascending=False).index)
+        if not sig_wght_chg.empty: print(f"\nSignificant Weight Changes (> +/- 0.1%, Top {top_n} by magnitude):\n{sig_wght_chg[['Rank_curr', 'Ticker', 'Name', 'Weight_curr', 'Weight_prev', 'Weight_Change']].head(top_n).to_string(index=False)}")
+        else: print("\nNo significant weight changes (> +/- 0.1%).")
+    else: print("\nNo continuously held stocks to compare changes for.")
 
 def main():
-    parser = argparse.ArgumentParser(description="Track ETF holdings and their changes over time.")
-    # Changed default to a relative path for easier local execution
-    parser.add_argument("--save_dir", default="./etf_tracker_output",
-                        help="Directory to download file and store historical CSVs. GitHub Actions will use ./etf_data.")
-    parser.add_argument("--etf_symbol_for_csv", default=ETF_SYMBOL, help=f"ETF symbol for CSV names (default: {ETF_SYMBOL}).")
-    parser.add_argument("--top_n", type=int, default=20, help="Top N holdings for summaries (default: 20).")
+    parser = argparse.ArgumentParser(description=f"Track {ETF_SYMBOL} ETF holdings, save to CSV and a master Excel file.")
+    parser.add_argument("--save_dir", default=DEFAULT_SAVE_DIR, help=f"Main directory for outputs. Default: './{DEFAULT_SAVE_DIR}'")
+    parser.add_argument("--etf_symbol_for_filename", default=ETF_SYMBOL, help=f"ETF symbol for output file names. Default: {ETF_SYMBOL}")
+    parser.add_argument("--top_n", type=int, default=20, help="Top N holdings for summaries. Default: 20")
+    parser.add_argument("--master_excel_name", default=MASTER_EXCEL_FILENAME_DEFAULT, help=f"Master Excel file name. Default: '{MASTER_EXCEL_FILENAME_DEFAULT}' in save_dir.")
 
-    import sys
-    # This argument filtering is specific to how Jupyter/IPython pass kernel args.
-    # It should be robust enough for GitHub Actions where these args won't be present.
-    if any('ipykernel_launcher.py' in arg for arg in sys.argv):
-        # If in IPython/Jupyter, filter out kernel-specific args if no other args are passed
-        filtered_args = [arg for arg in sys.argv[1:] if not (arg == '-f' or arg.startswith('-f='))]
-        if not filtered_args: # Only kernel args were present
-             args = parser.parse_args([]) # Use defaults
-        else:
-             args = parser.parse_args(filtered_args)
-    else:
-        # For standard command line or GitHub Actions
-        args = parser.parse_args()
+    args = parser.parse_args() if not any(arg for arg in sys.argv if 'ipykernel_launcher' in arg or 'colab_kernel_launcher' in arg) else parser.parse_args([])
+    print(f"--- Starting ETF Holdings Tracker for: {args.etf_symbol_for_filename} ---")
 
+    download_target_dir = args.save_dir
+    historical_csv_dir = os.path.join(args.save_dir, "historical_csvs")
+    master_excel_filepath = os.path.join(args.save_dir, args.master_excel_name)
 
-    print(f"Starting ETF Holdings Tracker for: {args.etf_symbol_for_csv}")
-    
-    # Global DATA_DIR is set based on the (potentially overridden) save_dir argument
-    global DATA_DIR
-    # args.save_dir will be './etf_data' when run from GitHub Actions
-    # args.save_dir will be './etf_tracker_output' if run locally without args
-    DATA_DIR = os.path.join(args.save_dir, "historical_data") 
-    
-    print(f"Raw downloaded files will be saved to: {args.save_dir}")
-    print(f"Processed historical CSV data will be stored in: {DATA_DIR}")
+    print(f"Raw downloaded files will be in: {download_target_dir}")
+    print(f"Historical daily CSVs will be in: {historical_csv_dir}")
+    print(f"Master Excel file: {master_excel_filepath}")
 
-    # Ensure the base save directory exists (for the raw download)
-    if not os.path.exists(args.save_dir):
-        os.makedirs(args.save_dir, exist_ok=True)
-        print(f"Created base save directory: {args.save_dir}")
-    # DATA_DIR for historical files will be created by save_holdings if needed
+    downloaded_content_path = download_mtum_holdings(download_target_dir)
+    if not downloaded_content_path: print("Failed to download ETF holdings. Exiting."); sys.exit(1)
 
-    downloaded_file_path = download_mtum_holdings(args.save_dir) # Raw download goes into save_dir
-    if not downloaded_file_path:
-        print("Failed to download. Exiting.")
-        return
-
-    current_holdings_df = load_and_process_holdings(downloaded_file_path)
+    current_holdings_df = load_and_process_holdings(downloaded_content_path)
     if current_holdings_df is None or current_holdings_df.empty:
-        print("Could not process holdings from the downloaded file. Exiting.")
-        # Optionally, clean up the downloaded file if it was bad
-        # os.remove(downloaded_file_path)
-        # print(f"Removed problematic downloaded file: {downloaded_file_path}")
-        return
+        print("Could not process downloaded holdings. Exiting."); sys.exit(1)
 
-    print(f"\n--- Top {args.top_n} Current Holdings ({args.etf_symbol_for_csv}) ---")
-    print(current_holdings_df[['Rank', 'Ticker', 'Name', 'Weight']].head(args.top_n).to_string(index=False))
-    
-    save_holdings(current_holdings_df, args.etf_symbol_for_csv) # Processed data goes into DATA_DIR
-    
-    previous_holdings_df = load_previous_holdings(args.etf_symbol_for_csv)
-    if previous_holdings_df is not None and not previous_holdings_df.empty:
-        compare_holdings(current_holdings_df, previous_holdings_df, top_n=args.top_n)
-    else:
-        print("\nNo valid previous holdings data found for comparison, or this is the first run.")
-    
-    print("\nTracker finished successfully.")
+    print(f"\n--- Top {args.top_n} Current Holdings ({args.etf_symbol_for_filename}) {datetime.now().strftime('%Y-%m-%d')} ---\n{current_holdings_df.head(args.top_n).to_string(index=False)}")
+    save_daily_csv(current_holdings_df, args.etf_symbol_for_filename, historical_csv_dir)
+    update_master_excel(current_holdings_df, master_excel_filepath)
+    previous_holdings_df = load_previous_holdings_from_csv(args.etf_symbol_for_filename, historical_csv_dir)
+    compare_holdings(current_holdings_df, previous_hold_df, top_n=args.top_n) if previous_holdings_df is not None else print("\nNo previous holdings CSV for comparison.")
+    print("\n--- ETF Tracker Finished ---")
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()
